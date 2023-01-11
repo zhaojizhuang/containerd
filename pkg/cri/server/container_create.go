@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/containerd/containerd/pkg/cri/annotations"
 	"path/filepath"
 	"time"
 
@@ -235,6 +236,7 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 	}
 
 	containerLabels := buildLabels(config.Labels, image.ImageSpec.Config.Labels, containerKindContainer)
+	containerLabels[annotations.ContainerLogPath] = meta.LogPath
 
 	runtimeOptions, err := getRuntimeOptions(sandboxInfo)
 	if err != nil {

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -321,6 +322,9 @@ func (c *criService) containerSpec(
 		customopts.WithAnnotation(annotations.SandboxName, sandboxConfig.GetMetadata().GetName()),
 		customopts.WithAnnotation(annotations.ContainerName, containerName),
 		customopts.WithAnnotation(annotations.ImageName, imageName),
+		customopts.WithAnnotation(annotations.ContainerLogPath, filepath.Join(sandboxConfig.GetLogDirectory(), config.GetLogPath())),
+		customopts.WithAnnotation(annotations.ContainerLogDriver, filepath.Join(sandboxConfig.GetLogDirectory(), config.GetLogPath())),
+
 	)
 	// cgroupns is used for hiding /sys/fs/cgroup from containers.
 	// For compatibility, cgroupns is not used when running in cgroup v1 mode or in privileged.
