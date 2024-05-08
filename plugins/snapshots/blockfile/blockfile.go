@@ -18,6 +18,7 @@ package blockfile
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -49,6 +50,9 @@ type SnapshotterConfig struct {
 	// mountOptions are the base options added to the mount (defaults to ["loop"])
 	mountOptions []string
 
+	// copySparse determine whether sparse files when copy (defaults to true，equivalent to "cp --sparse=always xxx")
+	copySparse bool
+
 	// testViewHookHelper is used to fsck or mount with rw to handle
 	// the recovery. If we mount ro for view snapshot, we might hit
 	// the issue like
@@ -70,7 +74,7 @@ func WithScratchFile(src string) Opt {
 	return func(root string, config *SnapshotterConfig) {
 		config.scratchGenerator = func(dst string) error {
 			// Copy src to dst
-			if err := copyFileWithSync(dst, src); err != nil {
+			if err := copyFileWithSync(dst, src, config.copySparse); err != nil {
 				return fmt.Errorf("failed to copy scratch: %w", err)
 			}
 			return nil
@@ -101,6 +105,13 @@ func WithRecreateScratch(recreate bool) Opt {
 	}
 }
 
+// WithCopySparse is used to determine that create sparse files when copy.
+func WithCopySparse(copySparse bool) Opt {
+	return func(root string, config *SnapshotterConfig) {
+		config.copySparse = copySparse
+	}
+}
+
 // withViewHookHelper introduces hook for preparing snapshot for View. It
 // should be used in test only.
 //
@@ -112,11 +123,12 @@ func withViewHookHelper(fn viewHookHelper) Opt {
 }
 
 type snapshotter struct {
-	root    string
-	scratch string
-	fsType  string
-	options []string
-	ms      *storage.MetaStore
+	root       string
+	scratch    string
+	fsType     string
+	options    []string
+	copySparse bool
+	ms         *storage.MetaStore
 
 	testViewHookHelper viewHookHelper
 }
@@ -385,11 +397,11 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 			path = o.getBlockFile(s.ID)
 
 			if len(s.ParentIDs) > 0 {
-				if err = copyFileWithSync(path, o.getBlockFile(s.ParentIDs[0])); err != nil {
+				if err = copyFileWithSync(path, o.getBlockFile(s.ParentIDs[0]), o.copySparse); err != nil {
 					return fmt.Errorf("copying of parent failed: %w", err)
 				}
 			} else {
-				if err = copyFileWithSync(path, o.scratch); err != nil {
+				if err = copyFileWithSync(path, o.scratch, o.copySparse); err != nil {
 					return fmt.Errorf("copying of scratch failed: %w", err)
 				}
 			}
@@ -448,7 +460,7 @@ func (o *snapshotter) Close() error {
 	return o.ms.Close()
 }
 
-func copyFileWithSync(target, source string) error {
+func copyFileWithSync(target, source string, copySparse bool) error {
 	// The Go stdlib does not seem to have an efficient os.File.ReadFrom
 	// routine for other platforms like it does on Linux with
 	// copy_file_range. For Darwin at least we can use clonefile
@@ -472,6 +484,80 @@ func copyFileWithSync(target, source string) error {
 	defer tgt.Close()
 	defer tgt.Sync()
 
-	_, err = io.Copy(tgt, src)
+	if copySparse {
+		_, err = CopySparse(tgt, src)
+	} else {
+		_, err = io.Copy(tgt, src)
+	}
+
 	return err
+}
+
+// CopySparse copies a file sparsely (omitting holes) from src to dst.
+func CopySparse(dst io.WriteSeeker, src io.Reader) (written int64, err error) {
+	return copyBuffer(dst, src, nil)
+}
+
+// copyBuffer copies bits from src to dst, seeking past blocks of zero bits in src. These
+// blocks are omitted, creating a file with holes in dst.
+func copyBuffer(dst io.WriteSeeker, src io.Reader, buf []byte) (written int64, err error) {
+
+	if buf == nil {
+		size := 1024 * 1024
+		if l, ok := src.(*io.LimitedReader); ok && int64(size) > l.N {
+			if l.N < 1 {
+				size = 1
+			} else {
+				size = int(l.N)
+			}
+		}
+		buf = make([]byte, size)
+	}
+	for {
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			// If non-zero data is read, write it. Otherwise, skip forwards.
+			if isAllZero(buf) {
+				if _, err = dst.Seek(int64(nr-1), io.SeekCurrent); err == nil {
+					if _, err = dst.Write([]byte{0}); err != nil {
+						return written, err
+					}
+				}
+				continue
+			}
+
+			nw, ew := dst.Write(buf[0:nr])
+			if nw < 0 || nr < nw {
+				nw = 0
+				if ew == nil {
+					ew = errors.New("invalid write result")
+				}
+			}
+			written += int64(nw)
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
+	}
+	return written, err
+}
+
+func isAllZero(buf []byte) bool {
+	for _, b := range buf {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }
